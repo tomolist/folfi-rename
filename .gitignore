@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Jupyter Notebookの自動保存ファイル
+.ipynb_checkpoints/
+
+# OSが自動生成する隠しファイル
+.DS_Store
+Thumbs.db
