@@ -196,6 +196,7 @@ class UndoJournal:
             {
                 "step": self.step_name,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "root": str(self.root),  # 診断メッセージ用（復元は相対パスを使う）
                 "ops": self.ops,
             }
         )
@@ -205,6 +206,27 @@ class UndoJournal:
         self.ops = []
 
     # -- 記録つきの操作 ----------------------------------------
+    def _rel(self, path):
+        """メインフォルダからの相対パスを返す。外側なら None。
+
+        絶対パスだけを記録すると、メインフォルダを移動・コピー・改名したときに
+        復元が誤動作する（コピー先で実行したのに元フォルダを動かしてしまう）。
+        そのため相対パスを併記し、復元時は「選んだフォルダ」を基準に解決する。
+        """
+        try:
+            return str(Path(path).relative_to(self.root))
+        except ValueError:
+            return None
+
+    def _record(self, op, **paths):
+        """op に絶対パスと相対パスの両方を入れて記録する。"""
+        for abs_key, value in paths.items():
+            op[abs_key] = str(value)
+            rel = self._rel(value)
+            if rel is not None:
+                op["r" + abs_key] = rel
+        self.ops.append(op)
+
     def move(self, src, dst):
         """src を dst へ移動（rename）して記録する。
 
@@ -218,7 +240,7 @@ class UndoJournal:
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
-        self.ops.append({"t": "move", "src": str(src), "dst": str(dst)})
+        self._record({"t": "move"}, src=src, dst=dst)
         return dst
 
     def mkdir(self, path):
@@ -234,7 +256,7 @@ class UndoJournal:
             p = p.parent
         path.mkdir(parents=True, exist_ok=True)
         for p in reversed(missing):
-            self.ops.append({"t": "mkdir", "path": str(p)})
+            self._record({"t": "mkdir"}, path=p)
         return path
 
     def rmdir(self, path):
@@ -244,7 +266,7 @@ class UndoJournal:
             path.rmdir()
         except OSError:
             return False
-        self.ops.append({"t": "rmdir", "path": str(path)})
+        self._record({"t": "rmdir"}, path=path)
         return True
 
     def trash(self, path):
@@ -293,6 +315,59 @@ def list_steps(root):
     return steps
 
 
+def _op_path(op, key, root):
+    """op のパスを解決する。相対パスがあれば「選んだフォルダ」を基準に使う。
+
+    相対パス（rsrc / rdst / rpath）は後から追加したキー。これがあるログは
+    メインフォルダを移動・コピー・改名しても正しく復元できる。
+    無い古いログは、記録された絶対パスをそのまま使う。
+    """
+    rel = op.get("r" + key)
+    if rel is not None:
+        return Path(root) / rel
+    return Path(op[key])
+
+
+def _preflight(step, root):
+    """復元を実行してよいか検査する。問題があれば理由の文字列を返す。"""
+    moves = [op for op in step["ops"] if op["t"] == "move"]
+    if not moves:
+        return None
+
+    root = Path(root)
+    outside = []
+    exists = 0
+    for op in moves:
+        dst = _op_path(op, "dst", root)
+        try:
+            dst.relative_to(root)
+        except ValueError:
+            outside.append(dst)
+        if dst.exists():
+            exists += 1
+
+    if outside:
+        return (
+            "記録されたパスが、選択したフォルダの外を指しています。\n"
+            f"    記録: {outside[0]}\n"
+            f"    選択: {root}\n"
+            "  メインフォルダを移動・コピー・名前変更した可能性があります。\n"
+            "  このまま実行すると、選択したフォルダではなく別の場所のファイルが\n"
+            "  動いてしまうため、中止しました。\n"
+            "  このログを作ったときと同じフォルダを選んでください。"
+        )
+
+    if exists == 0:
+        return (
+            f"復元対象のファイル・フォルダが1つも見つかりません（{len(moves)} 件すべて）。\n"
+            f"    選択: {root}\n"
+            "  メインフォルダを移動・名前変更したか、別のフォルダを選んでいる\n"
+            "  可能性があります。このログを作ったときと同じフォルダを選んでください。"
+        )
+
+    return None
+
+
 def undo_last(root, count=1):
     """最後のステップを巻き戻す。count を増やすと複数工程さかのぼれる。"""
     root = Path(root)
@@ -303,7 +378,16 @@ def undo_last(root, count=1):
             print("これ以上さかのぼれる履歴はありません。")
             break
 
-        step = data["steps"].pop()
+        # まだ pop しない。安全性を確認してから取り除く
+        step = data["steps"][-1]
+
+        problem = _preflight(step, root)
+        if problem:
+            print("\n⚠ 復元を中止しました。履歴は消していません。")
+            print("  " + problem)
+            break
+
+        data["steps"].pop()
         print(f"\n復元中: {step['step']}（{step['timestamp']}）")
 
         ok = 0
@@ -312,7 +396,8 @@ def undo_last(root, count=1):
         for op in reversed(step["ops"]):
             try:
                 if op["t"] == "move":
-                    src, dst = Path(op["src"]), Path(op["dst"])
+                    src = _op_path(op, "src", root)
+                    dst = _op_path(op, "dst", root)
                     if not dst.exists():
                         print(f"  スキップ: {dst} が見つかりません")
                         ng += 1
@@ -320,7 +405,7 @@ def undo_last(root, count=1):
                     src.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(dst), str(src))
                 elif op["t"] == "mkdir":
-                    p = Path(op["path"])
+                    p = _op_path(op, "path", root)
                     if p.is_dir():
                         try:
                             p.rmdir()
@@ -328,7 +413,7 @@ def undo_last(root, count=1):
                             # 後から中身が増えている場合は消さずに残す
                             print(f"  保持: {p}（空ではありません）")
                 elif op["t"] == "rmdir":
-                    Path(op["path"]).mkdir(parents=True, exist_ok=True)
+                    _op_path(op, "path", root).mkdir(parents=True, exist_ok=True)
                 else:
                     print(f"  不明な操作をスキップ: {op}")
                     ng += 1
@@ -381,5 +466,9 @@ def undo_interactive(title="復元したいメインフォルダを選択して�
     if not steps:
         return
 
-    undo_last(root)
-    print("\n復元が完了しました。")
+    before = len(steps)
+    data = undo_last(root)
+    if len(data["steps"]) < before:
+        print("\n復元が完了しました。")
+    else:
+        print("\n復元は行われませんでした。上のメッセージを確認してください。")
