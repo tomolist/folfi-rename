@@ -15,3 +15,6 @@ wheels/
 # OSが自動生成する隠しファイル
 .DS_Store
 Thumbs.db
+
+# 動作確認用の一時ファイル
+_tmp/
